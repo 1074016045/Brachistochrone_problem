@@ -395,30 +395,30 @@ def optimize_path_for_drag_or_combined(mu, k_drag, initial_guess=None):
 # ## Problem Statement and Geometry Setup
 # 
 # We consider a planar path
-# \[
+# $$
 # y = y(x),
-# \]
-# with downward vertical coordinate \(y\) (so larger \(y\) means lower physical height).
+# $$
+# with downward vertical coordinate $y$ (so larger $y$ means lower physical height).
 # 
 # Define the slope
-# \[
+# $$
 # y' = \frac{dy}{dx}.
-# \]
+# $$
 # 
 # For an infinitesimal curve segment,
-# \[
+# $$
 # ds = \sqrt{dx^2 + dy^2} = \sqrt{1 + (y')^2}\,dx.
-# \]
+# $$
 # 
-# If the speed at that point is \(v\), then
-# \[
+# If the speed at that point is $v$, then
+# $$
 # dt = \frac{ds}{v}.
-# \]
-# Therefore the total travel time from \(A\) to \(B\) is
-# \[
+# $$
+# Therefore the total travel time from $A$ to $B$ is
+# $$
 # T = \int dt = \int \frac{ds}{v}
 #   = \int \frac{\sqrt{1 + (y')^2}}{v}\,dx.
-# \]
+# $$
 # 
 # This geometric time functional is the common starting point for all four modelling cases below.
 
@@ -483,84 +483,84 @@ plt.show()
 # 
 # We now apply the geometry setup to the frictionless case.
 # 
-# Assume the particle starts at \(A=(0,0)\), and \(y\) is measured downward. Then gravitational potential loss becomes kinetic energy gain:
-# \[
+# Assume the particle starts at $A=(0,0)$, and $y$ is measured downward. Then gravitational potential loss becomes kinetic energy gain:
+# $$
 # \frac{1}{2}mv^2 = mgy.
-# \]
+# $$
 # Hence
-# \[
+# $$
 # v = \sqrt{2gy}.
-# \]
+# $$
 # 
 # Substituting into
-# \(
+# $
 # T=\int \frac{\sqrt{1+(y')^2}}{v}\,dx
-# \),
-# \[
+# $,
+# $$
 # T = \int \frac{\sqrt{1+(y')^2}}{\sqrt{2gy}}\,dx.
-# \]
+# $$
 # 
 # Define the Lagrangian
-# \[
+# $$
 # L(y,y') = \frac{\sqrt{1+(y')^2}}{\sqrt{2gy}}.
-# \]
-# Since \(L\) has no explicit \(x\)-dependence, we use the Beltrami identity:
-# \[
+# $$
+# Since $L$ has no explicit $x$-dependence, we use the Beltrami identity:
+# $$
 # L - y'\frac{\partial L}{\partial y'} = C.
-# \]
+# $$
 # 
 # Compute
-# \[
+# $$
 # \frac{\partial L}{\partial y'} = \frac{1}{\sqrt{2gy}}\cdot\frac{y'}{\sqrt{1+(y')^2}}.
-# \]
+# $$
 # Therefore
-# \[
+# $$
 # L - y'\frac{\partial L}{\partial y'}
 # = \frac{\sqrt{1+(y')^2}}{\sqrt{2gy}}
 # -\frac{(y')^2}{\sqrt{2gy}\sqrt{1+(y')^2}}
 # = \frac{1}{\sqrt{2gy}\sqrt{1+(y')^2}}.
-# \]
+# $$
 # So
-# \[
+# $$
 # \frac{1}{\sqrt{2gy}\sqrt{1+(y')^2}} = C.
-# \]
+# $$
 # Squaring both sides,
-# \[
+# $$
 # \frac{1}{2gy\left(1+(y')^2\right)} = C^2.
-# \]
+# $$
 # Therefore
-# \[
+# $$
 # y\left(1+(y')^2\right)=\frac{1}{2gC^2}\equiv k.
-# \]
-# This gives the first integral in the standard constant-\(k\) form:
-# \[
+# $$
+# This gives the first integral in the standard constant-$k$ form:
+# $$
 # y\bigl(1+(y')^2\bigr)=k,
-# \]
-# where \(k\) is a constant.
+# $$
+# where $k$ is a constant.
 # 
 # Then
-# \[
+# $$
 # (y')^2=\frac{k-y}{y},\qquad
 # \frac{dy}{dx}=\sqrt{\frac{k-y}{y}},\qquad
 # \frac{dx}{dy}=\sqrt{\frac{y}{k-y}}.
-# \]
+# $$
 # 
 # Use the substitution
-# \[
+# $$
 # y = k\sin^2\frac{\theta}{2}.
-# \]
+# $$
 # Then
-# \[
+# $$
 # y = \frac{k}{2}(1-\cos\theta),
 # \qquad
 # dy = \frac{k}{2}\sin\theta\,d\theta,
-# \]
-# and integrating for \(x\):
-# \[
+# $$
+# and integrating for $x$:
+# $$
 # x = \frac{k}{2}(\theta-\sin\theta).
-# \]
+# $$
 # 
-# This is the cycloid parametrization, with generating-circle radius \(k/2\).
+# This is the cycloid parametrization, with generating-circle radius $k/2$.
 
 # %%
 # Symbolic check for the frictionless Beltrami manipulation
@@ -643,93 +643,93 @@ fig.savefig("figures/03_frictionless_time_comparison.png", dpi=170)
 plt.show()
 
 # %% [markdown]
-# In the frictionless model, the cycloid descends relatively quickly at early \(x\), producing higher speed sooner than the straight line. Because the time integrand is \(dt = ds/v\), gaining speed early can reduce total time even if the geometric length is not minimal. This is why the brachistochrone is not the straight line.
+# In the frictionless model, the cycloid descends relatively quickly at early $x$, producing higher speed sooner than the straight line. Because the time integrand is $dt = ds/v$, gaining speed early can reduce total time even if the geometric length is not minimal. This is why the brachistochrone is not the straight line.
 
 # %% [markdown]
 # ## Brachistochrone with Kinetic Friction
 # 
 # We now follow the friction derivation exactly.
 # 
-# Let \(\mu\) be the kinetic friction coefficient. Let \(\alpha\) be the tangent angle, with
-# \[
+# Let $\mu$ be the kinetic friction coefficient. Let $\alpha$ be the tangent angle, with
+# $$
 # \tan\alpha = y',\qquad
 # \sin\alpha = \frac{y'}{\sqrt{1+(y')^2}},\qquad
 # \cos\alpha = \frac{1}{\sqrt{1+(y')^2}}.
-# \]
+# $$
 # 
 # The normal force is
-# \[
+# $$
 # N = mg\cos\alpha,
-# \]
+# $$
 # so kinetic friction magnitude is
-# \[
+# $$
 # F_f = \mu N = \mu mg\cos\alpha.
-# \]
+# $$
 # 
 # Tangential force balance:
-# \[
+# $$
 # F_t = mg\sin\alpha - \mu mg\cos\alpha.
-# \]
+# $$
 # Therefore tangential acceleration is
-# \[
+# $$
 # a_t = g(\sin\alpha - \mu\cos\alpha)
 #     = g\frac{y' - \mu}{\sqrt{1+(y')^2}}.
-# \]
+# $$
 # 
 # Using
-# \[
+# $$
 # a_t = v\frac{dv}{ds},\qquad ds=\sqrt{1+(y')^2}\,dx,
-# \]
+# $$
 # gives
-# \[
+# $$
 # v\frac{dv}{dx} = g(y' - \mu).
-# \]
-# Since \(dy = y' dx\),
-# \[
+# $$
+# Since $dy = y' dx$,
+# $$
 # v\,dv = g(dy - \mu\,dx).
-# \]
+# $$
 # Integrating:
-# \[
+# $$
 # \frac{v^2}{2} = g(y-\mu x),
-# \]
+# $$
 # hence
-# \[
+# $$
 # v = \sqrt{2g(y-\mu x)}.
-# \]
+# $$
 # 
 # Substitute into the time functional:
-# \[
+# $$
 # T = \int \frac{\sqrt{1+(y')^2}}{\sqrt{2g(y-\mu x)}}\,dx.
-# \]
+# $$
 # Define
-# \[
+# $$
 # L(y,y',x)=\frac{\sqrt{1+(y')^2}}{\sqrt{2g(y-\mu x)}}.
-# \]
+# $$
 # 
-# Here \(L\) depends explicitly on \(x\), so the Beltrami identity does not apply directly. We use Euler-Lagrange:
-# \[
+# Here $L$ depends explicitly on $x$, so the Beltrami identity does not apply directly. We use Euler-Lagrange:
+# $$
 # \frac{d}{dx}\left(\frac{\partial L}{\partial y'}\right)-\frac{\partial L}{\partial y}=0.
-# \]
+# $$
 # 
 # First compute
-# \[
+# $$
 # \frac{\partial L}{\partial y'}
 # = \frac{y'}{\sqrt{2g(y-\mu x)}\sqrt{1+(y')^2}},
-# \]
+# $$
 # and
-# \[
+# $$
 # \frac{\partial L}{\partial y}
 # = -\frac{\sqrt{1+(y')^2}}{2\sqrt{2g}(y-\mu x)^{3/2}}.
-# \]
+# $$
 # 
 # Substituting these into Euler-Lagrange and simplifying gives the nonlinear second-order ODE
-# \[
+# $$
 # 2(y-\mu x)y'' + (1+(y')^2)(1-\mu y') = 0,
-# \]
+# $$
 # equivalently
-# \[
+# $$
 # y'' = -\frac{(1+(y')^2)(1-\mu y')}{2(y-\mu x)}.
-# \]
+# $$
 # 
 # This equation is generally solved numerically.
 
@@ -890,9 +890,9 @@ fig.savefig("figures/05_friction_time_vs_mu.png", dpi=170)
 plt.show()
 
 # %% [markdown]
-# In implementation, we first attempted a direct BVP solve of the Euler-Lagrange ODE with a small near-start regularization (to avoid the \(y-\mu x=0\) singular point at \(x=0\)). When that direct route is unstable for some \(\mu\), we use smooth-path time minimization as a robust fallback. The derivation itself is unchanged.
+# In implementation, we first attempted a direct BVP solve of the Euler-Lagrange ODE with a small near-start regularization (to avoid the $y-\mu x=0$ singular point at $x=0$). When that direct route is unstable for some $\mu$, we use smooth-path time minimization as a robust fallback. The derivation itself is unchanged.
 # 
-# As \(\mu\) increases, the optimized path tends to avoid unnecessarily large arc length and extreme curvature, because friction continuously dissipates energy along the trajectory. Compared with the frictionless cycloid, the dissipative optimum typically becomes less aggressively "dive-then-flatten" and more balanced between gaining speed and limiting path length.
+# As $\mu$ increases, the optimized path tends to avoid unnecessarily large arc length and extreme curvature, because friction continuously dissipates energy along the trajectory. Compared with the frictionless cycloid, the dissipative optimum typically becomes less aggressively "dive-then-flatten" and more balanced between gaining speed and limiting path length.
 
 # %% [markdown]
 # ## Brachistochrone with Air Resistance
@@ -900,38 +900,38 @@ plt.show()
 # We now follow the drag-only derivation.
 # 
 # Use quadratic drag
-# \[
+# $$
 # F_d = k v^2.
-# \]
+# $$
 # 
-# Notation remark: earlier, \(k\) was used as the cycloid constant in \(y(1+(y')^2)=k\). The original notes reuse \(k\) for drag. In the code below, we rename drag coefficient as `k_drag` to avoid ambiguity; the derivation itself is unchanged.
+# Notation remark: earlier, $k$ was used as the cycloid constant in $y(1+(y')^2)=k$. The original notes reuse $k$ for drag. In the code below, we rename drag coefficient as `k_drag` to avoid ambiguity; the derivation itself is unchanged.
 # 
 # Start from tangential dynamics
-# \[
+# $$
 # m\frac{dv}{dt} = mg\sin\alpha - k_{\text{drag}} v^2.
-# \]
+# $$
 # Using
-# \[
+# $$
 # \sin\alpha = \frac{y'}{\sqrt{1+(y')^2}},
-# \]
+# $$
 # we obtain
-# \[
+# $$
 # \frac{dv}{dt} = g\frac{y'}{\sqrt{1+(y')^2}} - \frac{k_{\text{drag}}}{m}v^2.
-# \]
+# $$
 # 
 # Now use
-# \[
+# $$
 # \frac{dv}{dt}=v\frac{dv}{ds},\qquad ds=\sqrt{1+(y')^2}\,dx,
-# \]
+# $$
 # to get
-# \[
+# $$
 # \frac{dv}{dx} = \frac{g y'}{v} - \frac{k_{\text{drag}}}{m}v\sqrt{1+(y')^2}.
-# \]
+# $$
 # 
 # The total time remains
-# \[
+# $$
 # T = \int \frac{\sqrt{1+(y')^2}}{v(x)}\,dx.
-# \]
+# $$
 # 
 # This is not reducible to a simple closed-form variational first integral here, so we proceed numerically, consistent with the notes.
 
@@ -993,34 +993,34 @@ plt.show()
 # ## Brachistochrone with Both Friction and Air Resistance
 # 
 # Combine the two dissipative mechanisms:
-# \[
+# $$
 # m\frac{dv}{dt} = mg\sin\alpha - \mu mg\cos\alpha - k_{\text{drag}}v^2.
-# \]
+# $$
 # 
 # With
-# \[
+# $$
 # \sin\alpha = \frac{y'}{\sqrt{1+(y')^2}},
 # \qquad
 # \cos\alpha = \frac{1}{\sqrt{1+(y')^2}},
-# \]
+# $$
 # we get
-# \[
+# $$
 # \frac{dv}{dt} = g\frac{y'-\mu}{\sqrt{1+(y')^2}} - \frac{k_{\text{drag}}}{m}v^2.
-# \]
+# $$
 # 
 # Using
-# \[
+# $$
 # \frac{dv}{dt}=v\frac{dv}{ds},\qquad ds=\sqrt{1+(y')^2}\,dx,
-# \]
+# $$
 # yields
-# \[
+# $$
 # \frac{dv}{dx} = \frac{g}{v}(y'-\mu) - \frac{k_{\text{drag}}}{m}v\sqrt{1+(y')^2}.
-# \]
+# $$
 # 
 # And again
-# \[
+# $$
 # T = \int \frac{\sqrt{1+(y')^2}}{v(x)}\,dx.
-# \]
+# $$
 # 
 # As in the notes, this model is handled numerically.
 
@@ -1136,8 +1136,8 @@ plt.show()
 # ## Assumptions, Limitations, and Interpretation
 # 
 # 1. The model treats the slider as an idealized point particle moving on a prescribed smooth curve.
-# 2. Contact mechanics are simplified to kinetic friction with constant \(\mu\), which neglects possible speed, temperature, and material dependence.
-# 3. Air resistance is modeled as quadratic drag, \(F_d = k_{drag}v^2\), which is a useful but simplified representation.
+# 2. Contact mechanics are simplified to kinetic friction with constant $\mu$, which neglects possible speed, temperature, and material dependence.
+# 3. Air resistance is modeled as quadratic drag, $F_d = k_{drag}v^2$, which is a useful but simplified representation.
 # 4. For dissipative cases, the derivation leads to equations best treated numerically; this is exactly the direction indicated by the notes.
 # 5. Numerical optimization here uses a smooth monotone path basis and deterministic fallback integration so the notebook remains robust and fully executable.
 
