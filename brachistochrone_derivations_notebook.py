@@ -1,16 +1,3 @@
-# %% [markdown]
-# # Brachistochrone Problem and Dissipative Extensions
-# 
-# This notebook presents a complete derivation and numerical study of the brachistochrone problem and three dissipative extensions, following one consistent derivation flow:
-# 
-# 1. Classical frictionless brachistochrone
-# 2. Brachistochrone with kinetic friction
-# 3. Brachistochrone with quadratic air resistance
-# 4. Brachistochrone with both kinetic friction and quadratic air resistance
-# 
-# The notebook combines symbolic checks, numerical computation, and clear plots for a poster-ready project narrative.
-
-# %%
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -32,8 +19,13 @@ g = 9.81
 x_B = 10.0
 y_B = 5.0
 m = 75.0
+mu = 0.10
+rho = 1.225
+C_d = 1.0
+A = 0.0163265306122449  # Chosen so 0.5 * rho * C_d * A = 0.01 in the baseline drag sweep.
 mu_values = [0.0, 0.05, 0.1, 0.2]
-k_drag_values = [0.0, 0.01, 0.03]
+A_values = [0.0, A, 3.0 * A]
+combined_drag_pairs = [(0.05, A), (0.10, A), (0.10, 3.0 * A)]
 
 # Numerical controls
 N_PATH = 700
@@ -41,12 +33,12 @@ N_COEFF = 5
 EPS = 1e-10
 PENALTY_SCALE = 1e5
 MAX_COEFF = 3.0
+INVALID_PATH_PENALTY = 1e6
 
 np.set_printoptions(precision=5, suppress=True)
 
 print("Configuration loaded.")
 print(f"SymPy available: {SYMPY_AVAILABLE}")
-
 
 # Helper functions used in multiple sections
 
@@ -114,6 +106,46 @@ def build_path_from_coeffs(coeffs, x_end=x_B, y_end=y_B, n=N_PATH):
 
     return x, y, dy_dx
 
+def drag_force_constant(rho_air=rho, drag_coefficient=C_d, area=A):
+    """
+    Quadratic drag is written as F_drag = -C v^2 with C = 0.5 * rho * C_d * A.
+    """
+    return 0.5 * rho_air * drag_coefficient * area
+
+def drag_acceleration_constant(rho_air=rho, drag_coefficient=C_d, area=A, mass=m):
+    """
+    The segment update uses k = C / m so that a_drag = -k v^2.
+    """
+    return drag_force_constant(rho_air=rho_air, drag_coefficient=drag_coefficient, area=area) / mass
+
+def drag_summary(area, rho_air=rho, drag_coefficient=C_d, mass=m):
+    """
+    Convenience helper for reporting the derived drag constants C and k = C / m.
+    """
+    C_force = drag_force_constant(rho_air=rho_air, drag_coefficient=drag_coefficient, area=area)
+    return C_force, C_force / mass
+
+def build_segment_geometry(x, y):
+    """
+    Convert a pointwise path (x_i, y_i) into straight-segment geometry.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if len(x) != len(y):
+        raise ValueError("x and y must have matching lengths for segment geometry.")
+    if len(x) < 2:
+        raise ValueError("At least two path points are required.")
+
+    dx = np.diff(x)
+    dy = np.diff(y)
+    ds = np.hypot(dx, dy)
+
+    sin_theta = np.zeros_like(ds)
+    cos_theta = np.zeros_like(ds)
+    good = ds > EPS
+    sin_theta[good] = dy[good] / ds[good]
+    cos_theta[good] = dx[good] / ds[good]
+    return dx, dy, ds, sin_theta, cos_theta
 
 def solve_cycloid_parameters(x_end, y_end):
     """
@@ -150,13 +182,11 @@ def solve_cycloid_parameters(x_end, y_end):
     k_const = 2.0 * a
     return theta_f, a, k_const
 
-
 def cycloid_curve(a, theta_f, n=N_PATH):
     theta = np.linspace(0.0, theta_f, n)
     x = a * (theta - np.sin(theta))
     y = a * (1.0 - np.cos(theta))
     return theta, x, y
-
 
 def travel_time_from_u(x, yprime, u):
     x = np.asarray(x, dtype=float)
@@ -171,8 +201,485 @@ def travel_time_from_u(x, yprime, u):
 
     v = np.sqrt(np.clip(u, EPS, None))
     integrand = np.sqrt(1.0 + yprime**2) / v
-    return np.trapz(integrand, x)
+    return np.trapezoid(integrand, x)
 
+def compute_discrete_segment_dynamics(
+    x,
+    y,
+    mu=0.0,
+    rho_air=0.0,
+    drag_coefficient=C_d,
+    area=0.0,
+    mass=m,
+    grav=g,
+    eps=EPS,
+):
+    """
+    Shared discrete-segment update used by both travel-time evaluation and
+    post-processing motion reconstruction.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    yprime = np.gradient(y, x)
+    validate_path(x, y, yprime)
+
+    dx, dy, ds, sin_theta, cos_theta = build_segment_geometry(x, y)
+    C_force = drag_force_constant(rho_air=rho_air, drag_coefficient=drag_coefficient, area=area)
+    k_drag = C_force / mass
+
+    v_nodes = np.zeros(len(x), dtype=float)
+    u_nodes = np.zeros(len(x), dtype=float)
+    segment_acceleration = np.zeros(len(ds), dtype=float)
+    segment_time = np.zeros(len(ds), dtype=float)
+
+    valid = True
+    penalty = 0.0
+    messages = []
+
+    for i in range(len(ds)):
+        if ds[i] <= eps:
+            messages.append(f"Skipped near-zero segment {i}.")
+            v_nodes[i + 1] = v_nodes[i]
+            u_nodes[i + 1] = u_nodes[i]
+            continue
+
+        # This is the source-of-truth segment model used in the optimizer:
+        # gravity drives the motion, friction opposes it through N = m g cos(theta),
+        # and air drag removes speed through -k v^2.
+        segment_acceleration[i] = (
+            grav * sin_theta[i]
+            - mu * grav * cos_theta[i]
+            - k_drag * v_nodes[i] ** 2
+        )
+
+        u_next_raw = v_nodes[i] ** 2 + 2.0 * segment_acceleration[i] * ds[i]
+        if not np.isfinite(u_next_raw):
+            valid = False
+            penalty += INVALID_PATH_PENALTY
+            u_next = eps
+            messages.append(f"Non-finite velocity update on segment {i}.")
+        elif u_next_raw <= eps:
+            valid = False
+            penalty += INVALID_PATH_PENALTY + PENALTY_SCALE * max(eps - u_next_raw, 0.0) ** 2
+            u_next = eps
+            messages.append(f"Velocity collapsed on segment {i}.")
+        else:
+            u_next = u_next_raw
+
+        u_nodes[i + 1] = u_next
+        v_nodes[i + 1] = np.sqrt(max(u_next, eps))
+
+        denom = v_nodes[i] + v_nodes[i + 1]
+        if denom <= eps:
+            valid = False
+            penalty += INVALID_PATH_PENALTY
+            segment_time[i] = 2.0 * ds[i] / np.sqrt(eps)
+            messages.append(f"Degenerate segment-time denominator on segment {i}.")
+        else:
+            segment_time[i] = 2.0 * ds[i] / denom
+
+    total_time = float(np.sum(segment_time))
+    if not np.isfinite(total_time):
+        valid = False
+        penalty += INVALID_PATH_PENALTY
+        total_time = INVALID_PATH_PENALTY
+        messages.append("Total time became non-finite.")
+
+    t_nodes = np.concatenate(([0.0], np.cumsum(segment_time)))
+    objective = total_time + penalty
+    return {
+        "x": x,
+        "y": y,
+        "yprime": yprime,
+        "dx": dx,
+        "dy": dy,
+        "ds": ds,
+        "sin_theta": sin_theta,
+        "cos_theta": cos_theta,
+        "u": u_nodes,
+        "v": v_nodes,
+        "segment_acceleration": segment_acceleration,
+        "segment_time": segment_time,
+        "t_nodes": t_nodes,
+        "time": total_time,
+        "objective": objective,
+        "valid": valid,
+        "message": " | ".join(messages) if messages else "Discrete segment model completed normally.",
+        "C": C_force,
+        "k": k_drag,
+    }
+
+def travel_time_discrete_segments(
+    x,
+    y,
+    mu=0.0,
+    rho_air=0.0,
+    drag_coefficient=C_d,
+    area=0.0,
+    mass=m,
+    grav=g,
+    eps=EPS,
+):
+    """
+    Main dissipative model: treat the curve as straight line segments and update
+    the speed one segment at a time using constant tangential acceleration on
+    each segment.
+    """
+    return compute_discrete_segment_dynamics(
+        x,
+        y,
+        mu=mu,
+        rho_air=rho_air,
+        drag_coefficient=drag_coefficient,
+        area=area,
+        mass=mass,
+        grav=grav,
+        eps=eps,
+    )
+
+def simulate_motion_discrete_segments(
+    x,
+    y,
+    mu=0.0,
+    rho_air=0.0,
+    drag_coefficient=C_d,
+    area=0.0,
+    mass=m,
+    grav=g,
+    eps=EPS,
+    n_time_samples=700,
+    samples_per_segment=None,
+    time_samples=None,
+):
+    """
+    Reconstruct the motion in time while keeping the same discrete segment
+    physics as the optimizer and travel-time evaluator.
+    """
+    dynamics = compute_discrete_segment_dynamics(
+        x,
+        y,
+        mu=mu,
+        rho_air=rho_air,
+        drag_coefficient=drag_coefficient,
+        area=area,
+        mass=mass,
+        grav=grav,
+        eps=eps,
+    )
+
+    total_time = dynamics["time"]
+    t_nodes = dynamics["t_nodes"]
+    n_segments = len(dynamics["segment_time"])
+    messages = [dynamics["message"]]
+    valid = bool(dynamics["valid"])
+
+    if n_segments == 0 or total_time <= eps:
+        t_samples = np.array([0.0])
+        x_samples = np.array([dynamics["x"][0]])
+        y_samples = np.array([dynamics["y"][0]])
+        v_samples = np.array([dynamics["v"][0]])
+        a_samples = np.array([0.0])
+        segment_index = np.array([0], dtype=int)
+        if total_time <= eps:
+            messages.append("Total travel time is near zero; returned the start point only.")
+        return {
+            "t_samples": t_samples,
+            "x_samples": x_samples,
+            "y_samples": y_samples,
+            "v_samples": v_samples,
+            "a_samples": a_samples,
+            "segment_index": segment_index,
+            "total_time": total_time,
+            "valid": valid and total_time > eps,
+            "message": " | ".join(messages),
+            "x_path": dynamics["x"],
+            "y_path": dynamics["y"],
+        }
+
+    if time_samples is not None:
+        t_samples = np.asarray(time_samples, dtype=float)
+        if t_samples.ndim != 1:
+            raise ValueError("time_samples must be one-dimensional.")
+        if len(t_samples) == 0:
+            t_samples = np.linspace(0.0, total_time, max(int(n_time_samples), 2))
+        if np.any(~np.isfinite(t_samples)):
+            raise ValueError("time_samples must be finite.")
+        if np.any((t_samples < 0.0) | (t_samples > total_time)):
+            t_samples = np.clip(t_samples, 0.0, total_time)
+            messages.append("Requested time samples were clipped to the simulated time interval.")
+    elif samples_per_segment is not None:
+        samples_per_segment = max(int(samples_per_segment), 1)
+        t_chunks = []
+        for i in range(n_segments):
+            dt_i = dynamics["segment_time"][i]
+            if dt_i <= eps:
+                continue
+            t_chunks.append(np.linspace(t_nodes[i], t_nodes[i + 1], samples_per_segment, endpoint=False))
+        t_chunks.append(np.array([total_time]))
+        t_samples = np.unique(np.concatenate(t_chunks)) if t_chunks else np.array([0.0, total_time])
+    else:
+        t_samples = np.linspace(0.0, total_time, max(int(n_time_samples), 2))
+
+    segment_index = np.searchsorted(t_nodes, t_samples, side="right") - 1
+    segment_index = np.clip(segment_index, 0, n_segments - 1)
+
+    tau = t_samples - t_nodes[segment_index]
+    tau = np.clip(tau, 0.0, dynamics["segment_time"][segment_index])
+
+    ds = dynamics["ds"][segment_index]
+    vi = dynamics["v"][segment_index]
+    ai = dynamics["segment_acceleration"][segment_index]
+    dx = dynamics["dx"][segment_index]
+    dy = dynamics["dy"][segment_index]
+
+    s_local = vi * tau + 0.5 * ai * tau**2
+    safe_ds = np.where(ds > eps, ds, 1.0)
+    lam = np.clip(s_local / safe_ds, 0.0, 1.0)
+    lam = np.where(ds > eps, lam, 0.0)
+
+    x_samples = dynamics["x"][segment_index] + lam * dx
+    y_samples = dynamics["y"][segment_index] + lam * dy
+    v_samples = np.maximum(vi + ai * tau, 0.0)
+    a_samples = ai.copy()
+
+    time_match_error = abs(total_time - t_nodes[-1])
+    if time_match_error > 1e-10:
+        valid = False
+        messages.append(f"Simulator time mismatch detected ({time_match_error:.3e}).")
+
+    return {
+        "t_samples": t_samples,
+        "x_samples": x_samples,
+        "y_samples": y_samples,
+        "v_samples": v_samples,
+        "a_samples": a_samples,
+        "segment_index": segment_index,
+        "total_time": total_time,
+        "valid": valid,
+        "message": " | ".join(messages),
+        "x_path": dynamics["x"],
+        "y_path": dynamics["y"],
+        "segment_time": dynamics["segment_time"],
+        "segment_acceleration": dynamics["segment_acceleration"],
+        "v_nodes": dynamics["v"],
+        "u_nodes": dynamics["u"],
+        "time_match_error": time_match_error,
+        "C": dynamics["C"],
+        "k": dynamics["k"],
+    }
+
+def plot_motion_snapshots(
+    x_path,
+    y_path,
+    simulation_result,
+    num_snapshots=8,
+    ax=None,
+    title="Motion Snapshots Along the Path",
+):
+    """
+    Show a few time-ordered points moving along the path.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8.0, 5.0))
+    else:
+        fig = ax.figure
+
+    x_path = np.asarray(x_path, dtype=float)
+    y_path = np.asarray(y_path, dtype=float)
+    x_samples = np.asarray(simulation_result["x_samples"], dtype=float)
+    y_samples = np.asarray(simulation_result["y_samples"], dtype=float)
+    t_samples = np.asarray(simulation_result["t_samples"], dtype=float)
+
+    ax.plot(x_path, y_path, color="tab:gray", lw=2.5, label="Path")
+    ax.scatter([x_path[0], x_path[-1]], [y_path[0], y_path[-1]], c="k", s=50, zorder=5)
+
+    snap_count = min(max(int(num_snapshots), 2), len(t_samples))
+    snap_idx = np.linspace(0, len(t_samples) - 1, snap_count, dtype=int)
+    scatter = ax.scatter(
+        x_samples[snap_idx],
+        y_samples[snap_idx],
+        c=t_samples[snap_idx],
+        cmap="viridis",
+        s=60,
+        zorder=6,
+        label="Time samples",
+    )
+
+    ax.set_title(title)
+    ax.set_xlabel("$x$")
+    ax.set_ylabel("$y$ (positive downward)")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best")
+    fig.colorbar(scatter, ax=ax, label="time (s)")
+    fig.tight_layout()
+    return fig, ax
+
+def plot_x_y_v_vs_time(simulation_result, include_acceleration=True, title_prefix="Motion Reconstruction"):
+    """
+    Plot the reconstructed coordinates and speed as functions of time.
+    """
+    nrows = 4 if include_acceleration else 3
+    fig, axes = plt.subplots(nrows, 1, figsize=(8.2, 7.6), sharex=True)
+    if nrows == 1:
+        axes = [axes]
+
+    t = np.asarray(simulation_result["t_samples"], dtype=float)
+    x = np.asarray(simulation_result["x_samples"], dtype=float)
+    y = np.asarray(simulation_result["y_samples"], dtype=float)
+    v = np.asarray(simulation_result["v_samples"], dtype=float)
+    a = np.asarray(simulation_result["a_samples"], dtype=float)
+
+    axes[0].plot(t, x, lw=2.1, color="tab:blue")
+    axes[0].set_ylabel("$x(t)$")
+    axes[0].grid(alpha=0.25)
+
+    axes[1].plot(t, y, lw=2.1, color="tab:orange")
+    axes[1].set_ylabel("$y(t)$")
+    axes[1].grid(alpha=0.25)
+
+    axes[2].plot(t, v, lw=2.1, color="tab:green")
+    axes[2].set_ylabel("$v(t)$")
+    axes[2].grid(alpha=0.25)
+
+    if include_acceleration:
+        axes[3].plot(t, a, lw=1.8, color="tab:red")
+        axes[3].set_ylabel("$a(t)$")
+        axes[3].grid(alpha=0.25)
+        axes[3].set_xlabel("time (s)")
+    else:
+        axes[2].set_xlabel("time (s)")
+
+    axes[0].set_title(title_prefix)
+    fig.tight_layout()
+    return fig, axes
+
+def compute_energy_budget_discrete_segments(
+    x,
+    y,
+    mu=0.0,
+    rho_air=0.0,
+    drag_coefficient=C_d,
+    area=0.0,
+    mass=m,
+    grav=g,
+    eps=EPS,
+):
+    """
+    Compute a segment-wise energy budget using the same discrete update that
+    drives the path optimization and motion simulation.
+    """
+    dynamics = compute_discrete_segment_dynamics(
+        x,
+        y,
+        mu=mu,
+        rho_air=rho_air,
+        drag_coefficient=drag_coefficient,
+        area=area,
+        mass=mass,
+        grav=grav,
+        eps=eps,
+    )
+
+    x = dynamics["x"]
+    y = dynamics["y"]
+    ds = dynamics["ds"]
+    dy = dynamics["dy"]
+    cos_theta = dynamics["cos_theta"]
+    v_nodes = dynamics["v"]
+    C_force = dynamics["C"]
+
+    kinetic_nodes = 0.5 * mass * np.maximum(dynamics["u"], 0.0)
+    potential_drop_nodes = mass * grav * np.maximum(y, 0.0)
+
+    gravity_work_segments = mass * grav * np.maximum(dy, 0.0)
+    friction_loss_segments = mu * mass * grav * cos_theta * ds
+    drag_loss_segments = C_force * v_nodes[:-1] ** 2 * ds
+    dissipation_segments = friction_loss_segments + drag_loss_segments
+    kinetic_change_segments = np.diff(kinetic_nodes)
+
+    energy_balance_residual = kinetic_change_segments - (
+        gravity_work_segments - dissipation_segments
+    )
+
+    cumulative_gravity_work = np.concatenate(([0.0], np.cumsum(gravity_work_segments)))
+    cumulative_friction_loss = np.concatenate(([0.0], np.cumsum(friction_loss_segments)))
+    cumulative_drag_loss = np.concatenate(([0.0], np.cumsum(drag_loss_segments)))
+    cumulative_dissipation = np.concatenate(([0.0], np.cumsum(dissipation_segments)))
+    cumulative_residual = np.concatenate(([0.0], np.cumsum(energy_balance_residual)))
+
+    return {
+        "x": x,
+        "y": y,
+        "t_nodes": dynamics["t_nodes"],
+        "kinetic_nodes": kinetic_nodes,
+        "potential_drop_nodes": potential_drop_nodes,
+        "gravity_work_segments": gravity_work_segments,
+        "friction_loss_segments": friction_loss_segments,
+        "drag_loss_segments": drag_loss_segments,
+        "dissipation_segments": dissipation_segments,
+        "kinetic_change_segments": kinetic_change_segments,
+        "energy_balance_residual": energy_balance_residual,
+        "cumulative_gravity_work": cumulative_gravity_work,
+        "cumulative_friction_loss": cumulative_friction_loss,
+        "cumulative_drag_loss": cumulative_drag_loss,
+        "cumulative_dissipation": cumulative_dissipation,
+        "cumulative_residual": cumulative_residual,
+        "total_gravity_work": float(np.sum(gravity_work_segments)),
+        "total_friction_loss": float(np.sum(friction_loss_segments)),
+        "total_drag_loss": float(np.sum(drag_loss_segments)),
+        "total_dissipation": float(np.sum(dissipation_segments)),
+        "final_kinetic_energy": float(kinetic_nodes[-1]),
+        "valid": dynamics["valid"],
+        "message": dynamics["message"],
+        "C": dynamics["C"],
+        "k": dynamics["k"],
+    }
+
+def plot_energy_budget_vs_time(energy_result, title="Energy Budget Along the Motion"):
+    """
+    Plot the cumulative energy bookkeeping based on the discrete segment model.
+    """
+    t = np.asarray(energy_result["t_nodes"], dtype=float)
+    fig, axes = plt.subplots(2, 1, figsize=(8.2, 7.0), sharex=True)
+
+    axes[0].plot(t, energy_result["kinetic_nodes"], lw=2.1, color="tab:blue", label="Kinetic energy")
+    axes[0].plot(t, energy_result["potential_drop_nodes"], lw=2.1, color="tab:orange", label="Potential energy drop")
+    axes[0].set_ylabel("Energy (J)")
+    axes[0].set_title(title)
+    axes[0].grid(alpha=0.25)
+    axes[0].legend(loc="best")
+
+    axes[1].plot(t, energy_result["cumulative_gravity_work"], lw=2.0, color="tab:green", label="Cumulative gravity work")
+    axes[1].plot(t, energy_result["cumulative_friction_loss"], lw=2.0, color="tab:red", label="Friction loss")
+    axes[1].plot(t, energy_result["cumulative_drag_loss"], lw=2.0, color="tab:purple", label="Drag loss")
+    axes[1].plot(t, energy_result["cumulative_dissipation"], "--", lw=2.0, color="0.25", label="Total dissipation")
+    axes[1].set_xlabel("time (s)")
+    axes[1].set_ylabel("Energy (J)")
+    axes[1].grid(alpha=0.25)
+    axes[1].legend(loc="best")
+
+    fig.tight_layout()
+    return fig, axes
+
+def plot_dissipation_comparison(case_labels, energy_results, title="Energy Dissipation Across Representative Motions"):
+    """
+    Compare cumulative dissipation against path position for representative cases.
+    """
+    fig, ax = plt.subplots(figsize=(8.4, 5.0))
+    for label in case_labels:
+        x_nodes = np.asarray(energy_results[label]["x"], dtype=float)
+        cumulative_dissipation = np.asarray(energy_results[label]["cumulative_dissipation"], dtype=float)
+        ax.plot(x_nodes, cumulative_dissipation, lw=2.2, label=label)
+        ax.scatter([x_nodes[-1]], [cumulative_dissipation[-1]], s=35, zorder=5)
+
+    ax.set_xlabel("$x$")
+    ax.set_ylabel("Cumulative dissipated energy (J)")
+    ax.set_title(title)
+    ax.grid(alpha=0.22)
+    ax.legend(loc="best")
+
+    fig.tight_layout()
+    return fig, ax
 
 def integrate_u_profile(x, yprime, mu=0.0, k_drag=0.0, mass=m, grav=g):
     """
@@ -226,67 +733,129 @@ def integrate_u_profile(x, yprime, mu=0.0, k_drag=0.0, mass=m, grav=g):
 
     return u, False
 
-
 def friction_time_for_coeffs(coeffs, mu):
     x, y, yp = build_path_from_coeffs(coeffs)
-    validate_path(x, y, yp)
-    margin = y - mu * x
+    segment_result = travel_time_discrete_segments(
+        x,
+        y,
+        mu=mu,
+        rho_air=0.0,
+        drag_coefficient=C_d,
+        area=0.0,
+        mass=m,
+        grav=g,
+        eps=EPS,
+    )
+    return {
+        "objective": segment_result["objective"],
+        "time": segment_result["time"],
+        "x": x,
+        "y": y,
+        "yp": yp,
+        "u": segment_result["u"],
+        "v": segment_result["v"],
+        "segment_time": segment_result["segment_time"],
+        "segment_acceleration": segment_result["segment_acceleration"],
+        "ds": segment_result["ds"],
+        "sin_theta": segment_result["sin_theta"],
+        "cos_theta": segment_result["cos_theta"],
+        "valid": segment_result["valid"],
+        "physics_message": segment_result["message"],
+        "C": segment_result["C"],
+        "k": segment_result["k"],
+        "rho": 0.0,
+        "C_d": C_d,
+        "A": 0.0,
+        "mu": mu,
+    }
 
-    penalty = 0.0
-    bad = margin <= 1e-8
-    if np.any(bad):
-        penalty += PENALTY_SCALE * np.sum((1e-8 - margin[bad])**2)
-
-    u = 2.0 * g * np.clip(margin, EPS, None)
-    T = travel_time_from_u(x, yp, u)
-    return T + penalty, T, x, y, yp
-
-
-def drag_or_combined_time_for_coeffs(coeffs, mu, k_drag):
+def drag_or_combined_time_for_coeffs(coeffs, mu, rho_air, drag_coefficient, area):
     x, y, yp = build_path_from_coeffs(coeffs)
-    validate_path(x, y, yp)
-    u, solver_ok = integrate_u_profile(x, yp, mu=mu, k_drag=k_drag, mass=m, grav=g)
+    segment_result = travel_time_discrete_segments(
+        x,
+        y,
+        mu=mu,
+        rho_air=rho_air,
+        drag_coefficient=drag_coefficient,
+        area=area,
+        mass=m,
+        grav=g,
+        eps=EPS,
+    )
+    return {
+        "objective": segment_result["objective"],
+        "time": segment_result["time"],
+        "x": x,
+        "y": y,
+        "yp": yp,
+        "u": segment_result["u"],
+        "v": segment_result["v"],
+        "segment_time": segment_result["segment_time"],
+        "segment_acceleration": segment_result["segment_acceleration"],
+        "ds": segment_result["ds"],
+        "sin_theta": segment_result["sin_theta"],
+        "cos_theta": segment_result["cos_theta"],
+        "valid": segment_result["valid"],
+        "physics_message": segment_result["message"],
+        "C": segment_result["C"],
+        "k": segment_result["k"],
+        "rho": rho_air,
+        "C_d": drag_coefficient,
+        "A": area,
+        "mu": mu,
+        "solver_ok": False,
+    }
 
-    penalty = 0.0
-    if np.any(u <= 1e-10):
-        penalty += PENALTY_SCALE * np.sum((1e-10 - np.minimum(u, 1e-10))**2)
-
-    T = travel_time_from_u(x, yp, u)
-    return T + penalty, T, x, y, yp, u, solver_ok
-
-
-def optimize_path_for_friction(mu, initial_guess=None):
+def optimize_path_for_case(mu, rho_air, drag_coefficient, area, initial_guess=None, maxiter=500):
     if initial_guess is None:
         initial_guess = np.zeros(N_COEFF)
 
     bounds = [(-MAX_COEFF, MAX_COEFF)] * N_COEFF
 
     def objective(c):
-        val, _, _, _, _ = friction_time_for_coeffs(c, mu)
-        return val
+        result = drag_or_combined_time_for_coeffs(
+            c,
+            mu=mu,
+            rho_air=rho_air,
+            drag_coefficient=drag_coefficient,
+            area=area,
+        )
+        return result["objective"]
 
     res = minimize(
         objective,
         x0=np.array(initial_guess, dtype=float),
         method="L-BFGS-B",
         bounds=bounds,
-        options={"maxiter": 400, "ftol": 1e-10},
+        options={"maxiter": maxiter, "ftol": 1e-10},
     )
 
     coeffs = res.x if res.success else np.array(initial_guess, dtype=float)
-    total, T, x, y, yp = friction_time_for_coeffs(coeffs, mu)
+    result = drag_or_combined_time_for_coeffs(
+        coeffs,
+        mu=mu,
+        rho_air=rho_air,
+        drag_coefficient=drag_coefficient,
+        area=area,
+    )
+    result.update(
+        {
+            "success": bool(res.success),
+            "message": str(res.message),
+            "coeffs": coeffs,
+        }
+    )
+    return result
 
-    return {
-        "success": bool(res.success),
-        "message": str(res.message),
-        "coeffs": coeffs,
-        "objective": total,
-        "time": T,
-        "x": x,
-        "y": y,
-        "yp": yp,
-    }
-
+def optimize_path_for_friction(mu, initial_guess=None):
+    return optimize_path_for_case(
+        mu=mu,
+        rho_air=0.0,
+        drag_coefficient=C_d,
+        area=0.0,
+        initial_guess=initial_guess,
+        maxiter=400,
+    )
 
 def attempt_friction_bvp(mu, x_end=x_B, y_end=y_B):
     """
@@ -355,72 +924,15 @@ def attempt_friction_bvp(mu, x_end=x_B, y_end=y_B):
         "message": "BVP converged under near-start regularization",
     }
 
-
-def optimize_path_for_drag_or_combined(mu, k_drag, initial_guess=None):
-    if initial_guess is None:
-        initial_guess = np.zeros(N_COEFF)
-
-    bounds = [(-MAX_COEFF, MAX_COEFF)] * N_COEFF
-
-    def objective(c):
-        val, *_ = drag_or_combined_time_for_coeffs(c, mu=mu, k_drag=k_drag)
-        return val
-
-    res = minimize(
-        objective,
-        x0=np.array(initial_guess, dtype=float),
-        method="L-BFGS-B",
-        bounds=bounds,
-        options={"maxiter": 500, "ftol": 1e-10},
+def optimize_path_for_drag_or_combined(mu, rho_air=rho, drag_coefficient=C_d, area=A, initial_guess=None):
+    return optimize_path_for_case(
+        mu=mu,
+        rho_air=rho_air,
+        drag_coefficient=drag_coefficient,
+        area=area,
+        initial_guess=initial_guess,
+        maxiter=500,
     )
-
-    coeffs = res.x if res.success else np.array(initial_guess, dtype=float)
-    total, T, x, y, yp, u, solver_ok = drag_or_combined_time_for_coeffs(coeffs, mu=mu, k_drag=k_drag)
-
-    return {
-        "success": bool(res.success),
-        "message": str(res.message),
-        "coeffs": coeffs,
-        "objective": total,
-        "time": T,
-        "x": x,
-        "y": y,
-        "yp": yp,
-        "u": u,
-        "solver_ok": solver_ok,
-    }
-
-
-# %% [markdown]
-# ## Problem Statement and Geometry Setup
-# 
-# We consider a planar path
-# $$
-# y = y(x),
-# $$
-# with downward vertical coordinate $y$ (so larger $y$ means lower physical height).
-# 
-# Define the slope
-# $$
-# y' = \frac{dy}{dx}.
-# $$
-# 
-# For an infinitesimal curve segment,
-# $$
-# ds = \sqrt{dx^2 + dy^2} = \sqrt{1 + (y')^2}\,dx.
-# $$
-# 
-# If the speed at that point is $v$, then
-# $$
-# dt = \frac{ds}{v}.
-# $$
-# Therefore the total travel time from $A$ to $B$ is
-# $$
-# T = \int dt = \int \frac{ds}{v}
-#   = \int \frac{\sqrt{1 + (y')^2}}{v}\,dx.
-# $$
-# 
-# This geometric time functional is the common starting point for all four modelling cases below.
 
 # %%
 # Geometry illustration plot
@@ -476,91 +988,6 @@ ax.grid(alpha=0.25)
 ax.legend(loc="upper left")
 fig.tight_layout()
 fig.savefig("figures/01_geometry_setup.png", dpi=170)
-plt.show()
-
-# %% [markdown]
-# ## Classical Brachistochrone (No Friction)
-# 
-# We now apply the geometry setup to the frictionless case.
-# 
-# Assume the particle starts at $A=(0,0)$, and $y$ is measured downward. Then gravitational potential loss becomes kinetic energy gain:
-# $$
-# \frac{1}{2}mv^2 = mgy.
-# $$
-# Hence
-# $$
-# v = \sqrt{2gy}.
-# $$
-# 
-# Substituting into
-# $
-# T=\int \frac{\sqrt{1+(y')^2}}{v}\,dx
-# $,
-# $$
-# T = \int \frac{\sqrt{1+(y')^2}}{\sqrt{2gy}}\,dx.
-# $$
-# 
-# Define the Lagrangian
-# $$
-# L(y,y') = \frac{\sqrt{1+(y')^2}}{\sqrt{2gy}}.
-# $$
-# Since $L$ has no explicit $x$-dependence, we use the Beltrami identity:
-# $$
-# L - y'\frac{\partial L}{\partial y'} = C.
-# $$
-# 
-# Compute
-# $$
-# \frac{\partial L}{\partial y'} = \frac{1}{\sqrt{2gy}}\cdot\frac{y'}{\sqrt{1+(y')^2}}.
-# $$
-# Therefore
-# $$
-# L - y'\frac{\partial L}{\partial y'}
-# = \frac{\sqrt{1+(y')^2}}{\sqrt{2gy}}
-# -\frac{(y')^2}{\sqrt{2gy}\sqrt{1+(y')^2}}
-# = \frac{1}{\sqrt{2gy}\sqrt{1+(y')^2}}.
-# $$
-# So
-# $$
-# \frac{1}{\sqrt{2gy}\sqrt{1+(y')^2}} = C.
-# $$
-# Squaring both sides,
-# $$
-# \frac{1}{2gy\left(1+(y')^2\right)} = C^2.
-# $$
-# Therefore
-# $$
-# y\left(1+(y')^2\right)=\frac{1}{2gC^2}\equiv k.
-# $$
-# This gives the first integral in the standard constant-$k$ form:
-# $$
-# y\bigl(1+(y')^2\bigr)=k,
-# $$
-# where $k$ is a constant.
-# 
-# Then
-# $$
-# (y')^2=\frac{k-y}{y},\qquad
-# \frac{dy}{dx}=\sqrt{\frac{k-y}{y}},\qquad
-# \frac{dx}{dy}=\sqrt{\frac{y}{k-y}}.
-# $$
-# 
-# Use the substitution
-# $$
-# y = k\sin^2\frac{\theta}{2}.
-# $$
-# Then
-# $$
-# y = \frac{k}{2}(1-\cos\theta),
-# \qquad
-# dy = \frac{k}{2}\sin\theta\,d\theta,
-# $$
-# and integrating for $x$:
-# $$
-# x = \frac{k}{2}(\theta-\sin\theta).
-# $$
-# 
-# This is the cycloid parametrization, with generating-circle radius $k/2$.
 
 # %%
 # Symbolic check for the frictionless Beltrami manipulation
@@ -628,110 +1055,21 @@ ax.grid(alpha=0.25)
 ax.legend()
 fig.tight_layout()
 fig.savefig("figures/02_frictionless_paths.png", dpi=170)
-plt.show()
 
 fig, ax = plt.subplots(figsize=(6.8, 4.6))
 labels = ["Cycloid", "Straight line"]
 times = [T_cycloid_analytic, T_line_numeric]
-ax.bar(labels, times, color=["tab:blue", "tab:orange"])
+x_pos = np.arange(len(labels))
+ax.plot(x_pos, times, "o-", lw=2.2, color="tab:blue")
+ax.set_xticks(x_pos)
+ax.set_xticklabels(labels)
 ax.set_ylabel("Travel time (s)")
 ax.set_title("Frictionless Travel-Time Comparison")
 for i, t in enumerate(times):
     ax.text(i, t + 0.02 * max(times), f"{t:.3f} s", ha="center", fontsize=10)
+ax.grid(alpha=0.25)
 fig.tight_layout()
 fig.savefig("figures/03_frictionless_time_comparison.png", dpi=170)
-plt.show()
-
-# %% [markdown]
-# In the frictionless model, the cycloid descends relatively quickly at early $x$, producing higher speed sooner than the straight line. Because the time integrand is $dt = ds/v$, gaining speed early can reduce total time even if the geometric length is not minimal. This is why the brachistochrone is not the straight line.
-
-# %% [markdown]
-# ## Brachistochrone with Kinetic Friction
-# 
-# We now follow the friction derivation exactly.
-# 
-# Let $\mu$ be the kinetic friction coefficient. Let $\alpha$ be the tangent angle, with
-# $$
-# \tan\alpha = y',\qquad
-# \sin\alpha = \frac{y'}{\sqrt{1+(y')^2}},\qquad
-# \cos\alpha = \frac{1}{\sqrt{1+(y')^2}}.
-# $$
-# 
-# The normal force is
-# $$
-# N = mg\cos\alpha,
-# $$
-# so kinetic friction magnitude is
-# $$
-# F_f = \mu N = \mu mg\cos\alpha.
-# $$
-# 
-# Tangential force balance:
-# $$
-# F_t = mg\sin\alpha - \mu mg\cos\alpha.
-# $$
-# Therefore tangential acceleration is
-# $$
-# a_t = g(\sin\alpha - \mu\cos\alpha)
-#     = g\frac{y' - \mu}{\sqrt{1+(y')^2}}.
-# $$
-# 
-# Using
-# $$
-# a_t = v\frac{dv}{ds},\qquad ds=\sqrt{1+(y')^2}\,dx,
-# $$
-# gives
-# $$
-# v\frac{dv}{dx} = g(y' - \mu).
-# $$
-# Since $dy = y' dx$,
-# $$
-# v\,dv = g(dy - \mu\,dx).
-# $$
-# Integrating:
-# $$
-# \frac{v^2}{2} = g(y-\mu x),
-# $$
-# hence
-# $$
-# v = \sqrt{2g(y-\mu x)}.
-# $$
-# 
-# Substitute into the time functional:
-# $$
-# T = \int \frac{\sqrt{1+(y')^2}}{\sqrt{2g(y-\mu x)}}\,dx.
-# $$
-# Define
-# $$
-# L(y,y',x)=\frac{\sqrt{1+(y')^2}}{\sqrt{2g(y-\mu x)}}.
-# $$
-# 
-# Here $L$ depends explicitly on $x$, so the Beltrami identity does not apply directly. We use Euler-Lagrange:
-# $$
-# \frac{d}{dx}\left(\frac{\partial L}{\partial y'}\right)-\frac{\partial L}{\partial y}=0.
-# $$
-# 
-# First compute
-# $$
-# \frac{\partial L}{\partial y'}
-# = \frac{y'}{\sqrt{2g(y-\mu x)}\sqrt{1+(y')^2}},
-# $$
-# and
-# $$
-# \frac{\partial L}{\partial y}
-# = -\frac{\sqrt{1+(y')^2}}{2\sqrt{2g}(y-\mu x)^{3/2}}.
-# $$
-# 
-# Substituting these into Euler-Lagrange and simplifying gives the nonlinear second-order ODE
-# $$
-# 2(y-\mu x)y'' + (1+(y')^2)(1-\mu y') = 0,
-# $$
-# equivalently
-# $$
-# y'' = -\frac{(1+(y')^2)(1-\mu y')}{2(y-\mu x)}.
-# $$
-# 
-# This equation is generally solved numerically.
 
 # %%
 # Dedicated free-body style diagram for the friction derivation
@@ -788,7 +1126,6 @@ ax.grid(alpha=0.22)
 ax.legend(loc="upper right", fontsize=9)
 fig.tight_layout()
 fig.savefig("figures/04_friction_force_diagram.png", dpi=180)
-plt.show()
 
 # %%
 # Symbolic/semi-symbolic check for the friction Euler-Lagrange equation
@@ -831,11 +1168,8 @@ for mu in mu_values:
     bvp_results[mu] = attempt_friction_bvp(mu)
     result = optimize_path_for_friction(mu, initial_guess=initial)
     validate_path(result["x"], result["y"], result["yp"], x_end=x_B, y_end=y_B, tol=2e-5)
-    min_margin = np.min(result["y"] - mu * result["x"])
-    if min_margin < -1e-4:
-        raise ValueError(f"Friction path strongly violates y-mu*x>0 for mu={mu:.3f}.")
-    if min_margin <= 0:
-        print(f"Warning: mild y-mu*x undershoot ({min_margin:.2e}) for mu={mu:.3f}; kept by penalty regularization.")
+    if not result["valid"]:
+        print(f"Warning: discrete friction model flagged an invalid path for mu={mu:.3f}. {result['physics_message']}")
     friction_results[mu] = result
     initial = result["coeffs"]  # continuation in mu improves stability
 
@@ -874,7 +1208,6 @@ ax.grid(alpha=0.25)
 ax.legend(fontsize=9)
 fig.tight_layout()
 fig.savefig("figures/04_friction_paths.png", dpi=170)
-plt.show()
 
 mus_plot = np.array(mu_values)
 times_friction = np.array([friction_results[mu]["time"] for mu in mu_values])
@@ -887,53 +1220,6 @@ ax.set_ylabel("Optimized travel time (s)")
 ax.grid(alpha=0.28)
 fig.tight_layout()
 fig.savefig("figures/05_friction_time_vs_mu.png", dpi=170)
-plt.show()
-
-# %% [markdown]
-# In implementation, we first attempted a direct BVP solve of the Euler-Lagrange ODE with a small near-start regularization (to avoid the $y-\mu x=0$ singular point at $x=0$). When that direct route is unstable for some $\mu$, we use smooth-path time minimization as a robust fallback. The derivation itself is unchanged.
-# 
-# As $\mu$ increases, the optimized path tends to avoid unnecessarily large arc length and extreme curvature, because friction continuously dissipates energy along the trajectory. Compared with the frictionless cycloid, the dissipative optimum typically becomes less aggressively "dive-then-flatten" and more balanced between gaining speed and limiting path length.
-
-# %% [markdown]
-# ## Brachistochrone with Air Resistance
-# 
-# We now follow the drag-only derivation.
-# 
-# Use quadratic drag
-# $$
-# F_d = k v^2.
-# $$
-# 
-# Notation remark: earlier, $k$ was used as the cycloid constant in $y(1+(y')^2)=k$. The original notes reuse $k$ for drag. In the code below, we rename drag coefficient as `k_drag` to avoid ambiguity; the derivation itself is unchanged.
-# 
-# Start from tangential dynamics
-# $$
-# m\frac{dv}{dt} = mg\sin\alpha - k_{\text{drag}} v^2.
-# $$
-# Using
-# $$
-# \sin\alpha = \frac{y'}{\sqrt{1+(y')^2}},
-# $$
-# we obtain
-# $$
-# \frac{dv}{dt} = g\frac{y'}{\sqrt{1+(y')^2}} - \frac{k_{\text{drag}}}{m}v^2.
-# $$
-# 
-# Now use
-# $$
-# \frac{dv}{dt}=v\frac{dv}{ds},\qquad ds=\sqrt{1+(y')^2}\,dx,
-# $$
-# to get
-# $$
-# \frac{dv}{dx} = \frac{g y'}{v} - \frac{k_{\text{drag}}}{m}v\sqrt{1+(y')^2}.
-# $$
-# 
-# The total time remains
-# $$
-# T = \int \frac{\sqrt{1+(y')^2}}{v(x)}\,dx.
-# $$
-# 
-# This is not reducible to a simple closed-form variational first integral here, so we proceed numerically, consistent with the notes.
 
 # %%
 # Numerical optimization for drag-only case (mu = 0)
@@ -941,28 +1227,37 @@ plt.show()
 drag_results = {}
 initial = np.zeros(N_COEFF)
 
-for k_drag in k_drag_values:
-    result = optimize_path_for_drag_or_combined(mu=0.0, k_drag=k_drag, initial_guess=initial)
+for area_drag in A_values:
+    result = optimize_path_for_drag_or_combined(
+        mu=0.0,
+        rho_air=rho,
+        drag_coefficient=C_d,
+        area=area_drag,
+        initial_guess=initial,
+    )
     validate_path(result["x"], result["y"], result["yp"], x_end=x_B, y_end=y_B, tol=2e-5)
-    u_min = float(np.min(result["u"]))
-    if u_min < -1e-6:
-        raise ValueError(f"Severely negative u=v^2 encountered in drag-only case k_drag={k_drag:.3f}.")
-    if u_min < 0:
-        print(f"Warning: tiny negative u floor ({u_min:.2e}) clipped for drag-only case k_drag={k_drag:.3f}.")
-        result["u"] = np.clip(result["u"], 0.0, None)
-    drag_results[k_drag] = result
+    if not result["valid"]:
+        C_force, k_drag = drag_summary(area_drag, rho_air=rho, drag_coefficient=C_d, mass=m)
+        print(
+            f"Warning: discrete drag model flagged an invalid path for "
+            f"A={area_drag:.5f}, C={C_force:.5f}, k={k_drag:.6f}. {result['physics_message']}"
+        )
+    drag_results[area_drag] = result
     initial = result["coeffs"]
 
-print("Drag-only optimization status by k_drag:")
-for kd in k_drag_values:
-    r = drag_results[kd]
-    print(f"k_drag={kd:0.3f}: success={r['success']}, solver_ok={r['solver_ok']}, time={r['time']:.6f} s")
+print("Drag-only optimization status by derived drag constant k = C / m:")
+for area_drag in A_values:
+    r = drag_results[area_drag]
+    print(
+        f"A={area_drag:0.5f}, C={r['C']:.5f}, k={r['k']:.6f}: "
+        f"success={r['success']}, valid={r['valid']}, time={r['time']:.6f} s"
+    )
 
 fig, ax = plt.subplots(figsize=(8.4, 5.2))
 ax.plot(x_cyc, y_cyc, color="black", lw=3.0, label="Frictionless cycloid")
-for kd in k_drag_values:
-    r = drag_results[kd]
-    ax.plot(r["x"], r["y"], lw=2.2, label=f"Optimized with drag $k_{{drag}}={kd:.2f}$")
+for area_drag in A_values:
+    r = drag_results[area_drag]
+    ax.plot(r["x"], r["y"], lw=2.2, label=f"Optimized with drag $k={r['k']:.4f}$")
 
 ax.scatter([0, x_B], [0, y_B], c="k", s=55, zorder=5)
 ax.set_title("Optimized Paths with Quadratic Air Resistance")
@@ -972,117 +1267,60 @@ ax.grid(alpha=0.25)
 ax.legend(fontsize=9)
 fig.tight_layout()
 fig.savefig("figures/06_drag_paths.png", dpi=170)
-plt.show()
 
 fig, ax = plt.subplots(figsize=(7.4, 4.8))
-kd_plot = np.array(k_drag_values)
-td_plot = np.array([drag_results[kd]["time"] for kd in k_drag_values])
-ax.plot(kd_plot, td_plot, "o-", lw=2.2, color="tab:red")
-ax.set_title("Travel Time vs Drag Coefficient")
-ax.set_xlabel("$k_{drag}$")
+k_plot = np.array([drag_results[area_drag]["k"] for area_drag in A_values])
+td_plot = np.array([drag_results[area_drag]["time"] for area_drag in A_values])
+ax.plot(k_plot, td_plot, "o-", lw=2.2, color="tab:red")
+ax.set_title("Travel Time vs Derived Drag Constant")
+ax.set_xlabel("$k = C/m$")
 ax.set_ylabel("Optimized travel time (s)")
 ax.grid(alpha=0.28)
 fig.tight_layout()
 fig.savefig("figures/07_drag_time_vs_kdrag.png", dpi=170)
-plt.show()
-
-# %% [markdown]
-# The quadratic drag model is a useful extension for exploring dissipative effects, but for a human sliding system it is still a simplification. In practice, posture, contact mechanics, and speed-dependent effective area can all alter the effective drag law.
-
-# %% [markdown]
-# ## Brachistochrone with Both Friction and Air Resistance
-# 
-# Combine the two dissipative mechanisms:
-# $$
-# m\frac{dv}{dt} = mg\sin\alpha - \mu mg\cos\alpha - k_{\text{drag}}v^2.
-# $$
-# 
-# With
-# $$
-# \sin\alpha = \frac{y'}{\sqrt{1+(y')^2}},
-# \qquad
-# \cos\alpha = \frac{1}{\sqrt{1+(y')^2}},
-# $$
-# we get
-# $$
-# \frac{dv}{dt} = g\frac{y'-\mu}{\sqrt{1+(y')^2}} - \frac{k_{\text{drag}}}{m}v^2.
-# $$
-# 
-# Using
-# $$
-# \frac{dv}{dt}=v\frac{dv}{ds},\qquad ds=\sqrt{1+(y')^2}\,dx,
-# $$
-# yields
-# $$
-# \frac{dv}{dx} = \frac{g}{v}(y'-\mu) - \frac{k_{\text{drag}}}{m}v\sqrt{1+(y')^2}.
-# $$
-# 
-# And again
-# $$
-# T = \int \frac{\sqrt{1+(y')^2}}{v(x)}\,dx.
-# $$
-# 
-# As in the notes, this model is handled numerically.
 
 # %%
 # Numerical optimization for combined friction + drag
-combined_pairs = [
-    (0.05, 0.01),
-    (0.10, 0.01),
-    (0.10, 0.03),
-]
-
 combined_results = {}
 initial = np.zeros(N_COEFF)
 
-for mu_c, kd_c in combined_pairs:
-    result = optimize_path_for_drag_or_combined(mu=mu_c, k_drag=kd_c, initial_guess=initial)
+for mu_c, area_c in combined_drag_pairs:
+    result = optimize_path_for_drag_or_combined(
+        mu=mu_c,
+        rho_air=rho,
+        drag_coefficient=C_d,
+        area=area_c,
+        initial_guess=initial,
+    )
     validate_path(result["x"], result["y"], result["yp"], x_end=x_B, y_end=y_B, tol=2e-5)
-    u_min = float(np.min(result["u"]))
-    if u_min < -1e-6:
-        raise ValueError(
-            f"Severely negative u=v^2 encountered in combined case mu={mu_c:.3f}, k_drag={kd_c:.3f}."
-        )
-    if u_min < 0:
+    if not result["valid"]:
         print(
-            f"Warning: tiny negative u floor ({u_min:.2e}) clipped for combined case "
-            f"mu={mu_c:.3f}, k_drag={kd_c:.3f}."
+            f"Warning: discrete combined model flagged an invalid path for "
+            f"mu={mu_c:.3f}, A={area_c:.5f}, k={result['k']:.6f}. {result['physics_message']}"
         )
-        result["u"] = np.clip(result["u"], 0.0, None)
-
-    min_margin = float(np.min(result["y"] - mu_c * result["x"]))
-    if min_margin < -1e-4:
-        raise ValueError(
-            f"Combined path strongly violates y-mu*x>0 for mu={mu_c:.3f}, k_drag={kd_c:.3f}."
-        )
-    if min_margin <= 0:
-        print(
-            f"Warning: mild y-mu*x undershoot ({min_margin:.2e}) for combined case "
-            f"mu={mu_c:.3f}, k_drag={kd_c:.3f}."
-        )
-    combined_results[(mu_c, kd_c)] = result
+    combined_results[(mu_c, area_c)] = result
     initial = result["coeffs"]
 
 print("Combined-case optimization status:")
-for (mu_c, kd_c), r in combined_results.items():
+for (mu_c, area_c), r in combined_results.items():
     print(
-        f"mu={mu_c:.2f}, k_drag={kd_c:.2f}: success={r['success']}, "
-        f"solver_ok={r['solver_ok']}, time={r['time']:.6f} s"
+        f"mu={mu_c:.2f}, A={area_c:.5f}, C={r['C']:.5f}, k={r['k']:.6f}: "
+        f"success={r['success']}, valid={r['valid']}, time={r['time']:.6f} s"
     )
 
 # Choose one representative from each scenario for a 4-way path comparison
 mu_rep = 0.10
-kd_rep = 0.03
+area_rep = 3.0 * A
 
 fric_rep = friction_results[mu_rep]
-drag_rep = drag_results[kd_rep]
-comb_rep = combined_results[(0.10, 0.03)]
+drag_rep = drag_results[area_rep]
+comb_rep = combined_results[(0.10, area_rep)]
 
 fig, ax = plt.subplots(figsize=(8.7, 5.4))
 ax.plot(x_cyc, y_cyc, color="black", lw=3.0, label="1) Frictionless cycloid")
 ax.plot(fric_rep["x"], fric_rep["y"], lw=2.2, label=f"2) Friction only ($\\mu={mu_rep:.2f}$)")
-ax.plot(drag_rep["x"], drag_rep["y"], lw=2.2, label=f"3) Drag only ($k_{{drag}}={kd_rep:.2f}$)")
-ax.plot(comb_rep["x"], comb_rep["y"], lw=2.2, label=f"4) Friction+Drag ($\\mu=0.10,\ k_{{drag}}=0.03$)")
+ax.plot(drag_rep["x"], drag_rep["y"], lw=2.2, label=f"3) Drag only ($k={drag_rep['k']:.4f}$)")
+ax.plot(comb_rep["x"], comb_rep["y"], lw=2.2, label=f"4) Friction+Drag ($\\mu=0.10,\ k={comb_rep['k']:.4f}$)")
 
 ax.scatter([0, x_B], [0, y_B], c="k", s=55, zorder=5)
 ax.set_title("Comparison of Optimal Paths Across Model Assumptions")
@@ -1092,14 +1330,13 @@ ax.grid(alpha=0.25)
 ax.legend(fontsize=9)
 fig.tight_layout()
 fig.savefig("figures/08_four_case_path_comparison.png", dpi=170)
-plt.show()
 
 # Summary travel-time figure across model assumptions
 summary_labels = [
     "Frictionless\nCycloid",
     "Friction only\n(mu=0.10)",
-    "Drag only\n(k_drag=0.03)",
-    "Friction + Drag\n(mu=0.10, k_drag=0.03)",
+    f"Drag only\n(k={drag_rep['k']:.4f})",
+    f"Friction + Drag\n(mu=0.10, k={comb_rep['k']:.4f})",
 ]
 summary_times = [
     T_cycloid_analytic,
@@ -1109,39 +1346,133 @@ summary_times = [
 ]
 
 fig, ax = plt.subplots(figsize=(8.0, 5.0))
-colors = ["tab:blue", "tab:green", "tab:red", "tab:purple"]
-ax.bar(summary_labels, summary_times, color=colors)
+x_pos = np.arange(len(summary_labels))
+ax.plot(x_pos, summary_times, "o-", lw=2.3, color="tab:blue")
+ax.set_xticks(x_pos)
+ax.set_xticklabels(summary_labels)
 ax.set_ylabel("Travel time (s)")
 ax.set_title("Travel-Time Summary Across Four Modelling Cases")
 for i, t in enumerate(summary_times):
     ax.text(i, t + 0.02 * max(summary_times), f"{t:.3f}", ha="center", fontsize=10)
+ax.grid(alpha=0.25)
 fig.tight_layout()
 fig.savefig("figures/09_time_summary_four_cases.png", dpi=170)
-plt.show()
 
 # Also show combined-case sensitivities over selected parameter pairs
 fig, ax = plt.subplots(figsize=(7.8, 4.8))
-pair_labels = [f"$\\mu={mu_c:.2f}$\n$k_{{drag}}={kd_c:.2f}$" for mu_c, kd_c in combined_pairs]
-pair_times = [combined_results[(mu_c, kd_c)]["time"] for mu_c, kd_c in combined_pairs]
-ax.bar(pair_labels, pair_times, color="tab:gray")
-ax.set_title("Combined Model: Optimized Time for Representative $(\\mu, k_{drag})$ Pairs")
+pair_labels = [f"$\\mu={mu_c:.2f}$\n$k={combined_results[(mu_c, area_c)]['k']:.4f}$" for mu_c, area_c in combined_drag_pairs]
+pair_times = [combined_results[(mu_c, area_c)]["time"] for mu_c, area_c in combined_drag_pairs]
+x_pos = np.arange(len(pair_labels))
+ax.plot(x_pos, pair_times, "o-", lw=2.2, color="tab:gray")
+ax.set_xticks(x_pos)
+ax.set_xticklabels(pair_labels)
+ax.set_title("Combined Model: Optimized Time for Representative $(\\mu, k)$ Pairs")
 ax.set_ylabel("Travel time (s)")
 for i, t in enumerate(pair_times):
     ax.text(i, t + 0.015 * max(pair_times), f"{t:.3f}", ha="center", fontsize=10)
+ax.grid(alpha=0.25)
 fig.tight_layout()
 fig.savefig("figures/10_combined_pair_times.png", dpi=170)
-plt.show()
 
-# %% [markdown]
-# ## Assumptions, Limitations, and Interpretation
-# 
-# 1. The model treats the slider as an idealized point particle moving on a prescribed smooth curve.
-# 2. Contact mechanics are simplified to kinetic friction with constant $\mu$, which neglects possible speed, temperature, and material dependence.
-# 3. Air resistance is modeled as quadratic drag, $F_d = k_{drag}v^2$, which is a useful but simplified representation.
-# 4. For dissipative cases, the derivation leads to equations best treated numerically; this is exactly the direction indicated by the notes.
-# 5. Numerical optimization here uses a smooth monotone path basis and deterministic fallback integration so the notebook remains robust and fully executable.
+# %%
+# Representative time-resolved simulation on the optimized combined-case path
+motion_example = simulate_motion_discrete_segments(
+    comb_rep["x"],
+    comb_rep["y"],
+    mu=comb_rep["mu"],
+    rho_air=comb_rep["rho"],
+    drag_coefficient=comb_rep["C_d"],
+    area=comb_rep["A"],
+    mass=m,
+    grav=g,
+    n_time_samples=900,
+)
 
-# %% [markdown]
-# ## Conclusion
-# 
-# Across all four modelling assumptions, the classical frictionless cycloid remains the benchmark minimum-time curve. When dissipation is added (friction, drag, or both), the optimal path shifts away from the pure cycloid toward shapes that balance early acceleration against continuous energy loss. The framework in this notebook preserves the derivation flow exactly and extends naturally to numerical optimization for the non-conservative cases.
+print("Motion reconstruction status:")
+print(f"valid={motion_example['valid']}, total_time={motion_example['total_time']:.6f} s")
+print(f"time-match error vs segment sum = {motion_example['time_match_error']:.3e} s")
+if not motion_example["valid"]:
+    print(f"Warning: {motion_example['message']}")
+
+fig, ax = plot_motion_snapshots(
+    comb_rep["x"],
+    comb_rep["y"],
+    motion_example,
+    num_snapshots=9,
+    title="Combined-Case Motion Snapshots on the Optimized Path",
+)
+fig.savefig("figures/11_motion_snapshots_combined.png", dpi=170)
+
+fig, axes = plot_x_y_v_vs_time(
+    motion_example,
+    include_acceleration=True,
+    title_prefix="Combined-Case Motion: $x(t)$, $y(t)$, $v(t)$, $a(t)$",
+)
+fig.savefig("figures/12_motion_time_series_combined.png", dpi=170)
+
+# %%
+# Energy and dissipation analysis for representative motions
+energy_cases = {
+    "Frictionless": compute_energy_budget_discrete_segments(
+        x_cyc,
+        y_cyc,
+        mu=0.0,
+        rho_air=0.0,
+        drag_coefficient=C_d,
+        area=0.0,
+        mass=m,
+        grav=g,
+    ),
+    "Friction only": compute_energy_budget_discrete_segments(
+        fric_rep["x"],
+        fric_rep["y"],
+        mu=fric_rep["mu"],
+        rho_air=0.0,
+        drag_coefficient=fric_rep["C_d"],
+        area=0.0,
+        mass=m,
+        grav=g,
+    ),
+    "Drag only": compute_energy_budget_discrete_segments(
+        drag_rep["x"],
+        drag_rep["y"],
+        mu=0.0,
+        rho_air=drag_rep["rho"],
+        drag_coefficient=drag_rep["C_d"],
+        area=drag_rep["A"],
+        mass=m,
+        grav=g,
+    ),
+    "Friction + Drag": compute_energy_budget_discrete_segments(
+        comb_rep["x"],
+        comb_rep["y"],
+        mu=comb_rep["mu"],
+        rho_air=comb_rep["rho"],
+        drag_coefficient=comb_rep["C_d"],
+        area=comb_rep["A"],
+        mass=m,
+        grav=g,
+    ),
+}
+
+print("Energy budget summary for representative motions:")
+for label, energy in energy_cases.items():
+    print(
+        f"{label}: gravity={energy['total_gravity_work']:.3f} J, "
+        f"friction loss={energy['total_friction_loss']:.3f} J, "
+        f"drag loss={energy['total_drag_loss']:.3f} J, "
+        f"final kinetic={energy['final_kinetic_energy']:.3f} J"
+    )
+
+fig, ax = plot_dissipation_comparison(
+    list(energy_cases.keys()),
+    energy_cases,
+    title="Cumulative Energy Dissipation vs Position",
+)
+fig.savefig("figures/13_energy_dissipation_comparison.png", dpi=170)
+
+fig, axes = plot_energy_budget_vs_time(
+    energy_cases["Friction + Drag"],
+    title="Combined-Case Energy Budget Along the Motion",
+)
+fig.savefig("figures/14_energy_budget_combined.png", dpi=170)
